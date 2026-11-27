@@ -1,8 +1,10 @@
-// png-squeeze-01 entry: lossless PNG re-encoder.
+// png-squeeze-01 entry v2: lossless PNG re-encoder.
 // Self-contained (Node builtins only). Decodes each input with the kit decoder
 // logic, screens colour forms (palette / grey / RGB / RGBA / tRNS key) and
-// per-row filter choices by actual zlib size, and writes the smallest valid PNG.
-// Deterministic: no clock, no randomness; work is bounded by input size only.
+// per-row filter choices by actual zlib size, then re-selects every row's
+// filter under a fixed-Huffman DEFLATE cost model (filter DP) and writes the
+// smallest valid PNG. Deterministic: no clock, no randomness; work is bounded
+// by input size only.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { constants, deflateSync, inflateSync } from 'node:zlib';
@@ -199,6 +201,39 @@ function samplesOf(rgba, ct) {
 }
 function paletteOrder(colours, order) {
   const lum = (c) => 299 * c.rgba[0] + 587 * c.rgba[1] + 114 * c.rgba[2];
+  if (order === 'nearest') {
+    // Greedy nearest-neighbour chain in RGBA space, transparent entries first
+    // (so tRNS stays short) then opaque: consecutive indices hold similar
+    // colours, so Sub/Paeth filters emit small deltas and the index stream
+    // compresses better than count or luminance order on flat images.
+    const dist2 = (a, b) => {
+      const dr = a.rgba[0] - b.rgba[0], dg = a.rgba[1] - b.rgba[1];
+      const db = a.rgba[2] - b.rgba[2], da = a.rgba[3] - b.rgba[3];
+      return 299 * dr * dr + 587 * dg * dg + 114 * db * db + 1000 * da * da;
+    };
+    const chain = (group) => {
+      const rest = [...group];
+      if (rest.length === 0) return [];
+      let si = 0;
+      for (let i = 1; i < rest.length; i++) {
+        if (rest[i].count > rest[si].count || (rest[i].count === rest[si].count && rest[i].word < rest[si].word)) si = i;
+      }
+      const out = [rest.splice(si, 1)[0]];
+      while (rest.length > 0) {
+        const last = out[out.length - 1];
+        let bi = 0, bd = Infinity;
+        for (let i = 0; i < rest.length; i++) {
+          const d = dist2(last, rest[i]);
+          if (d < bd || (d === bd && rest[i].word < rest[bi].word)) { bd = d; bi = i; }
+        }
+        out.push(rest.splice(bi, 1)[0]);
+      }
+      return out;
+    };
+    const transparent = colours.filter((c) => c.rgba[3] !== 255);
+    const opaque = colours.filter((c) => c.rgba[3] === 255);
+    return [...chain(transparent), ...chain(opaque)];
+  }
   return [...colours].sort((x, y) => {
     const ta = x.rgba[3] === 255 ? 1 : 0;
     const tb = y.rgba[3] === 255 ? 1 : 0;
@@ -228,7 +263,7 @@ function formsOf(rgba) {
   const { opaque, grey, colours } = analyse(rgba);
   const forms = [];
   if (colours !== null) {
-    for (const order of ['count', 'luminance']) {
+    for (const order of ['count', 'luminance', 'nearest']) {
       const p = paletteForm(rgba, colours, order);
       forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns });
     }
@@ -847,6 +882,107 @@ function smoothed(freq) {
   return out;
 }
 
+// ---------- filter DP: re-choose each row's filter under a fixed-Huffman cost model ----------
+// v1's 'brute' picks each row's filter by zlib level-4 size of that row alone:
+// short-sighted, because a filter that looks slightly worse for this row can
+// set up much longer matches in the rows after it. This pass re-chooses every
+// row's filter to minimise an estimate of the row's true DEFLATE bit cost:
+// literals priced by the fixed Huffman lengths, matches priced by length code
+// + extra bits + 5-bit fixed distance code + distance extra bits, with matches
+// found against the already-chosen prefix (single-entry 3-byte hash table,
+// most recent position) and inside the candidate row itself. The prefix is the
+// stream the real deflate will see, so the cost model tracks the actual
+// objective. One deterministic sweep, bounded by the input size: no clock, no
+// randomness.
+function dpMatchCost(len, dist) {
+  const [lc, le] = LEN_CODE[len];
+  const [dc, de] = DIST_CODE[dist];
+  return FIXED_LIT_LEN[257 + lc] + le + 5 + de;
+}
+// Estimated bit cost of one filtered row, given the chosen prefix stream.
+// head: Int32Array(32768) hash -> most recent stream offset in pref (or -1).
+// rowPos/rowMark: stamp-indexed table of the most recent offset of each
+// 3-byte hash inside this row; mark identifies this evaluation.
+function estimateRowCost(row, pref, prefLen, head, rowPos, rowMark, mark) {
+  const n = row.length;
+  let bits = 0;
+  let p = 0;
+  while (p < n) {
+    let bestLen = 0, bestDist = 0;
+    if (p + 3 <= n) {
+      const h = ((row[p] << 10) ^ (row[p + 1] << 5) ^ row[p + 2]) & 32767;
+      // within-row candidate: most recent earlier offset with this hash
+      if (rowMark[h] === mark) {
+        const q = rowPos[h];
+        const dist = p - q;
+        const maxLen = Math.min(258, n - p);
+        let len = 0;
+        while (len < maxLen && row[p + len] === row[p + len - dist]) len++;
+        if (len >= 3) { bestLen = len; bestDist = dist; }
+      }
+      // prefix candidate: most recent stream offset with this hash
+      const r = head[h];
+      if (r >= 0) {
+        const dist = prefLen + 1 + p - r;
+        if (dist <= 32768) {
+          const maxLen = Math.min(258, n - p, prefLen - r);
+          let len = 0;
+          while (len < maxLen && pref[r + len] === row[p + len]) len++;
+          if (len >= 3 && (len > bestLen || (len === bestLen && dist < bestDist))) { bestLen = len; bestDist = dist; }
+        }
+      }
+    }
+    if (bestLen >= 3) {
+      bits += dpMatchCost(bestLen, bestDist);
+      if (p + 3 <= n) {
+        const h = ((row[p] << 10) ^ (row[p + 1] << 5) ^ row[p + 2]) & 32767;
+        rowPos[h] = p; rowMark[h] = mark;
+      }
+      p += bestLen;
+    } else {
+      bits += FIXED_LIT_LEN[row[p]];
+      if (p + 3 <= n) {
+        const h = ((row[p] << 10) ^ (row[p + 1] << 5) ^ row[p + 2]) & 32767;
+        rowPos[h] = p; rowMark[h] = mark;
+      }
+      p++;
+    }
+  }
+  return bits;
+}
+// Re-select every row's filter for one form's samples. Returns the DP stream:
+// one filter byte + filtered bytes per row, in row order.
+function reselectFilters(samples, width, height, bpp) {
+  const stride = width * bpp, rowLen = stride + 1;
+  const out = new Uint8Array(height * rowLen);
+  const head = new Int32Array(32768).fill(-1);
+  const rowPos = new Int32Array(32768);
+  const rowMark = new Uint32Array(32768);
+  const trial = Array.from({ length: 5 }, () => new Uint8Array(stride));
+  const seen = new Uint32Array(65536);
+  let stamp = 0, mark = 0, prefLen = 0;
+  for (let y = 0; y < height; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    let bestT = 0, bestCost = Infinity;
+    for (let t = 0; t < 5; t++) {
+      filterTrial(t, cur, prev, bpp, trial[t], seen, ++stamp);
+      const c = FIXED_LIT_LEN[t] + estimateRowCost(trial[t], out, prefLen, head, rowPos, rowMark, ++mark);
+      if (c < bestCost) { bestCost = c; bestT = t; }
+    }
+    const at = y * rowLen;
+    out[at] = bestT;
+    out.set(trial[bestT], at + 1);
+    // insert every stream offset of this row into the prefix hash table
+    for (let i = at; i < at + rowLen - 2; i++) {
+      const h = ((out[i] << 10) ^ (out[i + 1] << 5) ^ out[i + 2]) & 32767;
+      head[h] = i;
+    }
+    prefLen = at + rowLen;
+  }
+  return out;
+}
+
 // ---------- main ----------
 const SCREEN = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
 const FINAL = { level: 9, memLevel: 9 };
@@ -864,6 +1000,13 @@ for (const id of readdirSync(I).sort()) {
       if (best === null || bytes < best.bytes) best = { form, choice, data, bytes };
     }
   }
+  // Filter DP: re-choose every row's filter under the fixed-Huffman cost
+  // model; keep whichever stream (screen winner or DP) zlib level 9 writes
+  // smaller, then re-compress that winner.
+  const dpData = reselectFilters(best.form.samples, width, height, best.form.bpp);
+  const zDp = deflateSync(dpData, { ...FINAL, strategy: constants.Z_DEFAULT_STRATEGY }).length;
+  const zBest = deflateSync(best.data, { ...FINAL, strategy: constants.Z_DEFAULT_STRATEGY }).length;
+  if (zDp < zBest) best = { ...best, data: dpData, bytes: zDp + chunkBytes(best.form) };
   // Re-compress the winner: zlib level 9 (both strategies) and the bounded
   // optimal-parse deflate; keep the smallest stream overall.
   let bestZ = null, bestTotal = Infinity;
@@ -872,7 +1015,7 @@ for (const id of readdirSync(I).sort()) {
     const total = z.length + chunkBytes(best.form);
     if (total < bestTotal) { bestTotal = total; bestZ = z; }
   }
-  const mine = deflateZlib(best.data, { blockSize: 262144, chainLimit: 64, iterations: 2, goodLen: 128 });
+  const mine = deflateZlib(best.data, { blockSize: 262144, chainLimit: 128, iterations: 2, goodLen: 128 });
   if (mine.length + chunkBytes(best.form) < bestTotal) { bestTotal = mine.length + chunkBytes(best.form); bestZ = mine; }
   const chunks = [['IHDR', ihdrOf(width, height, best.form.colourType)]];
   if (best.form.plte !== null) chunks.push(['PLTE', best.form.plte]);
