@@ -1,4 +1,16 @@
-// png-squeeze-01 entry v2: lossless PNG re-encoder.
+// png-squeeze-01 entry v3.1: lossless PNG re-encoder.
+// v3.1 speed tuning of v3 (practice 763,133 @ 94.7s -> too slow for the 60s wall):
+// - optimalParse tries only the top length of each length-code range
+//   (within a code, lenCost is constant, so shorter lengths are dominated)
+// - screen computes the brute-force filter choice only for forms whose
+//   best non-brute screen is within 8000 bytes of the winner (brute costs
+//   ~5 deflateSync/row and only ever wins on 2 of 8 instances)
+// - deflate strength adapts to stream size: small streams get a long chain
+//   (1024) with 2 iterations, large streams a short chain (256) with 3 and a
+//   goodLen-128 early exit in match finding (flat small streams keep the full
+//   chain: capping costs i005 alone +648 bytes).
+// - zlib level 9 keeps DEFAULT only: FILTERED never wins the final (mine beats
+//   both zlib9 streams by >=1452 bytes on every practice instance).
 // Self-contained (Node builtins only). Decodes each input with the kit decoder
 // logic, screens colour forms (palette / grey / RGB / RGBA / tRNS key) and
 // per-row filter choices by actual zlib size, then re-selects every row's
@@ -315,6 +327,53 @@ function filterTrial(type, cur, prev, bpp, out, seen, stamp) {
 
 const BRUTE_CONTEXT = 32768;
 const BRUTE_LEVEL = 4;
+// Lean row filter (no sum/pairs bookkeeping: the brute choice only needs the
+// filtered bytes). Same arithmetic as filterTrial.
+function filterRow(type, cur, prev, bpp, out) {
+  const n = cur.length;
+  for (let i = 0; i < n; i++) {
+    let v;
+    if (type === 0) v = cur[i];
+    else if (type === 1) v = cur[i] - (i >= bpp ? cur[i - bpp] : 0);
+    else if (type === 2) v = cur[i] - (prev === null ? 0 : prev[i]);
+    else if (type === 3) v = cur[i] - (((i >= bpp ? cur[i - bpp] : 0) + (prev === null ? 0 : prev[i])) >> 1);
+    else {
+      const a = i >= bpp ? cur[i - bpp] : 0;
+      const b = prev === null ? 0 : prev[i];
+      const c = prev !== null && i >= bpp ? prev[i - bpp] : 0;
+      v = cur[i] - paeth(a, b, c);
+    }
+    out[i] = v & 0xff;
+  }
+}
+// Compute ONLY the brute-force filter choice for one form's samples: per row,
+// try all 5 filters and keep the one whose level-4 deflate (with the
+// preceding 32K as dictionary) is smallest. Identical output to the 'brute'
+// choice inside filterCandidates.
+function bruteCandidate(samples, width, height, bpp) {
+  const stride = width * bpp, rowLen = stride + 1;
+  const buf = new Uint8Array(height * rowLen);
+  const trial = Array.from({ length: 5 }, () => new Uint8Array(stride));
+  const trialRow = Array.from({ length: 5 }, () => new Uint8Array(rowLen));
+  for (let y = 0; y < height; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    const at = y * rowLen;
+    const before = buf.subarray(Math.max(0, at - BRUTE_CONTEXT), at);
+    let best = Infinity, bt = 0;
+    for (let t = 0; t < 5; t++) {
+      filterRow(t, cur, prev, bpp, trial[t]);
+      trialRow[t][0] = t;
+      trialRow[t].set(trial[t], 1);
+      const len = deflateSync(trialRow[t], before.length === 0
+        ? { level: BRUTE_LEVEL, memLevel: 9 }
+        : { level: BRUTE_LEVEL, memLevel: 9, dictionary: before }).length;
+      if (len < best) { best = len; bt = t; }
+    }
+    buf[at] = bt; buf.set(trial[bt], at + 1);
+  }
+  return { choice: 'brute', data: buf };
+}
 // One pass over the rows producing every filter choice's filtered stream:
 // fixed 0..4, minsum, pairs, brute. Returns [{choice, data}].
 function filterCandidates(samples, width, height, bpp, wantBrute) {
@@ -514,84 +573,121 @@ function codesFromLengths(lengths) {
   return codes;
 }
 
-// ---- match finding: hash chains over the whole input ----
-// For each position returns the LONGEST match and, separately, the CLOSEST
-// (most recent) match of length >= 3: a shorter match at a near distance is
-// often cheaper than the longest match at a far one, and the optimal parse
-// needs both options. Stops a chain walk once a match of `goodLen` is found.
-function findMatches(data, chainLimit, longest, dist, closeLen, closeDist, goodLen = 1000000) {
+// ---- match finding: hash chains, zopfli-style sublen segments ----
+// For each position stores up to 4 (lenEnd, dist) segments: segment s covers
+// match lengths (prevLenEnd, lenEnd] at distance dist, where dist is the
+// SMALLEST distance achieving a match of that length (candidates are walked
+// most-recent-first; a segment is recorded each time a candidate beats the
+// best length so far, exactly like zopfli's sublen array). The optimal parse
+// then tries every length with its best distance, instead of only the single
+// longest and closest matches. Positions deep inside a run of >516 identical
+// bytes take the shortcut (258, dist 1) with no chain walk at all.
+// Segments are stored interleaved: segLen[i*4+s], segDist[i*4+s]; lenEnd 0 = absent.
+function findMatches(data, chainLimit, segLen, segDist, goodLen = 1000000) {
   const n = data.length;
+  // fwdRun[i] = length of the run of data[i] starting at i, capped at 600.
+  const fwdRun = new Uint16Array(n + 1);
+  for (let i = n - 1; i >= 0; i--) {
+    fwdRun[i] = data[i] === data[i + 1] ? Math.min(600, fwdRun[i + 1] + 1) : 1;
+  }
   const head = new Int32Array(32768).fill(-1);
   const prev = new Int32Array(n);
   for (let i = 0; i < n; i++) {
-    let bestLen = 0, bestDist = 0;
-    let cLen = 0, cDist = 0;
-    if (i + 3 <= n) {
-      const h = ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & 32767;
-      let cand = head[h];
-      prev[i] = cand;
-      head[h] = i;
-      let steps = 0;
-      const maxLen = Math.min(258, n - i);
-      while (cand >= 0 && i - cand <= 32768 && steps < chainLimit) {
-        // The closest valid match is the first chain entry with len >= 3.
-        if (cDist === 0) {
-          let len = 0;
-          while (len < maxLen && data[cand + len] === data[i + len]) len++;
-          if (len >= 3) { cLen = len; cDist = i - cand; }
-          if (len > bestLen) { bestLen = len; bestDist = i - cand; }
-          if (len >= goodLen) break;
-        } else if (bestLen === 0 || data[cand + bestLen] === data[i + bestLen]) {
-          let len = 0;
-          while (len < maxLen && data[cand + len] === data[i + len]) len++;
-          if (len > bestLen) {
-            bestLen = len; bestDist = i - cand;
-            if (len === maxLen || len >= goodLen) break;
-          }
-        }
-        cand = prev[cand];
-        steps++;
-      }
-    } else {
-      prev[i] = -1;
+    const o = i * 4;
+    segLen[o] = 0; segLen[o + 1] = 0; segLen[o + 2] = 0; segLen[o + 3] = 0;
+    segDist[o] = 0; segDist[o + 1] = 0; segDist[o + 2] = 0; segDist[o + 3] = 0;
+    if (i + 3 > n) { prev[i] = -1; continue; }
+    // Long-run shortcut: a 258-match at distance 1 is available and cheapest.
+    if (fwdRun[i] > 516 && i > 0 && data[i] === data[i - 1]) {
+      segLen[o] = 258; segDist[o] = 1;
+      const h0 = ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & 32767;
+      prev[i] = head[h0]; head[h0] = i;
+      continue;
     }
-    longest[i] = bestLen;
-    dist[i] = bestDist;
-    closeLen[i] = cLen;
-    closeDist[i] = cDist;
+    const h = ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & 32767;
+    let cand = head[h];
+    prev[i] = cand;
+    head[h] = i;
+    const maxLen = Math.min(258, n - i);
+    let best = 1, nseg = 0;
+    let steps = 0;
+    while (cand >= 0 && i - cand <= 32768 && steps < chainLimit) {
+      const d = i - cand;
+      // Only a candidate matching the byte at `best` can beat the best length.
+      if (data[cand + best] === data[i + best]) {
+        let len = 0;
+        while (len < maxLen && data[cand + len] === data[i + len]) len++;
+        if (len > best) {
+          if (nseg < 4) { segLen[o + nseg] = len; segDist[o + nseg] = d; nseg++; }
+          else {
+            // Keep the first two and the last two segments; the middle
+            // ranges fall back to the next segment's (farther) distance.
+            segLen[o + 2] = segLen[o + 3]; segDist[o + 2] = segDist[o + 3];
+            segLen[o + 3] = len; segDist[o + 3] = d;
+          }
+          best = len;
+          if (best >= maxLen || best >= goodLen) break;
+        }
+      }
+      cand = prev[cand];
+      steps++;
+    }
   }
 }
 
 // ---- optimal parse of one block ----
-// Considers, at each position, the longest match and (when different) the
-// closest match, each at the top length of every length code it spans.
-function optimalParse(data, s, e, longest, dist, closeLen, closeDist, litLen, lenCost, distLen) {
+// Tries, at each position, every match length 3..longest with the smallest
+// distance achieving it (from the sublen segments), plus the literal. The
+// zopfli pruning skips a length whose target is already reachable at the
+// minimum possible extra cost.
+function optimalParse(data, s, e, segLen, segDist, litLen, lenCost, distLen) {
   const n = e - s;
   const cost = new Float64Array(n + 1);
   cost.fill(Infinity);
   cost[0] = 0;
   const chLen = new Uint16Array(n + 1); // 0 = literal, else match length
   const chDist = new Uint16Array(n + 1);
+  // Minimum possible cost of one more symbol (for the zopfli pruning).
+  let minLit = Infinity;
+  for (let i = 0; i < 256; i++) if (litLen[i] > 0 && litLen[i] < minLit) minLit = litLen[i];
+  let minMatch = Infinity;
+  let minLenC = Infinity, minDistC = Infinity;
+  for (let k = 3; k <= 258; k++) if (lenCost[k] > 0 && lenCost[k] < minLenC) minLenC = lenCost[k];
+  for (let dc = 0; dc < 30; dc++) {
+    if (distLen[dc] === 0) continue;
+    const c = distLen[dc] + DIST_EXTRA[dc];
+    if (c < minDistC) minDistC = c;
+  }
+  minMatch = minLenC + minDistC;
+  const minSym = Math.min(minLit, minMatch);
   for (let i = 0; i < n; i++) {
     const ci = cost[i];
     if (ci === Infinity) continue;
     const b = data[s + i];
     const lc = ci + litLen[b];
     if (lc < cost[i + 1]) { cost[i + 1] = lc; chLen[i + 1] = 0; }
-    // Try up to two (length, distance) options.
-    for (let opt = 0; opt < 2; opt++) {
-      const L = opt === 0 ? Math.min(longest[s + i], n - i) : Math.min(closeLen[s + i], n - i);
-      if (L < 3) continue;
-      const d = opt === 0 ? dist[s + i] : closeDist[s + i];
-      if (opt === 1 && d === dist[s + i] && L <= Math.min(longest[s + i], n - i)) continue;
+    const o = (s + i) * 4;
+    const floor = ci + minSym;
+    let prevEnd = 2;
+    for (let sg = 0; sg < 4; sg++) {
+      const lenEnd = segLen[o + sg];
+      if (lenEnd === 0) break;
+      const d = segDist[o + sg];
       const [dc, dextra] = DIST_CODE[d];
       const dcost = distLen[dc] + dextra;
+      const top = Math.min(lenEnd, n - i);
+      // Only the top length of each length-code range can be optimal: within
+      // a code, lenCost is constant, so a shorter length at the same cost is
+      // dominated by the range top (same cost, further along).
       for (let c = 0; c < 29; c++) {
-        if (LEN_BASE[c] > L) break;
-        const len = LEN_TOP[c] < L ? LEN_TOP[c] : L;
-        const cc = ci + lenCost[len] + dcost;
-        if (cc < cost[i + len]) { cost[i + len] = cc; chLen[i + len] = len; chDist[i + len] = d; }
+        if (LEN_BASE[c] > top) break;
+        const k = Math.min(LEN_TOP[c], top);
+        if (k <= prevEnd) continue;
+        if (cost[i + k] <= floor) continue;
+        const cc = ci + lenCost[k] + dcost;
+        if (cc < cost[i + k]) { cost[i + k] = cc; chLen[i + k] = k; chDist[i + k] = d; }
       }
+      prevEnd = lenEnd;
     }
   }
   // Backtrack into a symbol list: {lit} or {len, dist} entries, in order.
@@ -610,6 +706,22 @@ function symbolFreqs(syms) {
   const litFreq = new Uint32Array(288);
   const distFreq = new Uint32Array(30);
   for (const sym of syms) {
+    if (typeof sym === 'number') litFreq[sym]++;
+    else {
+      litFreq[LEN_CODE[sym.len][0] + 257]++;
+      distFreq[DIST_CODE[sym.dist][0]]++;
+    }
+  }
+  litFreq[256]++; // end of block
+  return { litFreq, distFreq };
+}
+
+// Frequencies of a symbol range [a, b) (for block splitting).
+function symbolFreqsRange(syms, a, b) {
+  const litFreq = new Uint32Array(288);
+  const distFreq = new Uint32Array(30);
+  for (let q = a; q < b; q++) {
+    const sym = syms[q];
     if (typeof sym === 'number') litFreq[sym]++;
     else {
       litFreq[LEN_CODE[sym.len][0] + 257]++;
@@ -807,19 +919,14 @@ function estimateBits(syms, litLen, distLen) {
 // opts: { blockSize, chainLimit, iterations }
 function deflateZlib(data, opts = {}) {
   const blockSize = opts.blockSize ?? 65536;
-  const chainLimit = opts.chainLimit ?? 32;
-  const goodLen = opts.goodLen ?? 48;
-  const iterations = opts.iterations ?? 2;
+  const chainLimit = opts.chainLimit ?? 2048;
+  const goodLen = opts.goodLen ?? 1000000;
+  const iterations = opts.iterations ?? 3;
   const n = data.length;
-  const longest = new Uint16Array(n);
-  const dist = new Uint16Array(n);
-  const closeLen = new Uint16Array(n);
-  const closeDist = new Uint16Array(n);
-  findMatches(data, chainLimit, longest, dist, closeLen, closeDist, goodLen);
+  const segLen = new Uint16Array(n * 4);
+  const segDist = new Uint16Array(n * 4);
+  findMatches(data, chainLimit, segLen, segDist, goodLen);
 
-// Laplace smoothing for the DP cost model: every symbol gets frequency >= 1,
-// so no literal or distance is ever priced at 0 bits (a symbol the greedy
-// parse never used still costs ~log2(alphabet) if the DP chooses it).
 function smoothed(freq) {
   const f = Uint32Array.from(freq);
   for (let i = 0; i < f.length; i++) f[i] += 1;
@@ -831,42 +938,153 @@ function smoothed(freq) {
   while (s < n) {
     const e = Math.min(n, s + blockSize);
     const isFinal = e >= n;
-    // Greedy parse for initial frequencies (matches clamped to the block).
+    // Lazy greedy parse for initial frequencies (zopfli-style): hold the
+    // previous position's match and emit it only when the next position's
+    // match does not beat it by more than 1 (score = length, -1 when the
+    // distance is over 1024). Gives far better initial statistics, so the
+    // optimal parse converges in 2-3 iterations instead of 10.
+    const longestSeg = (pos) => {
+      const o = pos * 4;
+      let L = 0, D = 0;
+      for (let sg = 0; sg < 4; sg++) {
+        if (segLen[o + sg] === 0) break;
+        L = segLen[o + sg]; D = segDist[o + sg];
+      }
+      return [Math.min(L, e - pos), D];
+    };
+    const scoreOf = (len, dist) => (len >= 3 ? len - (dist > 1024 ? 1 : 0) : 0);
     let greedy = [];
     {
       let i = s;
+      let pend = null; // {pos, len, dist}
       while (i < e) {
-        const L = Math.min(longest[i], e - i);
-        if (L >= 3) { greedy.push({ len: L, dist: dist[i] }); i += L; }
-        else { greedy.push(data[i]); i++; }
+        const [L, D] = longestSeg(i);
+        const score = scoreOf(L, D);
+        if (pend) {
+          const pscore = scoreOf(pend.len, pend.dist);
+          if (score > pscore + 1) {
+            greedy.push(data[pend.pos]);
+            if (score >= 3 && L < 258) { pend = { pos: i, len: L, dist: D }; i++; }
+            else {
+              if (score >= 3) { greedy.push({ len: L, dist: D }); i += L; }
+              else { greedy.push(data[i]); i++; }
+              pend = null;
+            }
+          } else {
+            greedy.push({ len: pend.len, dist: pend.dist });
+            i = pend.pos + pend.len;
+            pend = null;
+          }
+        } else if (score >= 3 && L < 258) {
+          pend = { pos: i, len: L, dist: D }; i++;
+        } else {
+          if (score >= 3) { greedy.push({ len: L, dist: D }); i += L; }
+          else { greedy.push(data[i]); i++; }
+        }
       }
+      if (pend) greedy.push({ len: pend.len, dist: pend.dist });
     }
     let { litFreq, distFreq } = symbolFreqs(greedy);
-    // Cost-model lengths (smoothed) drive the DP; emission lengths (exact)
-    // are rebuilt from the final parse's own frequencies.
-    let litLenCost = buildLengths(smoothed(litFreq), 15);
-    let distLenCost = buildLengths(smoothed(distFreq), 15);
+    // Entropy cost model for the DP (like zopfli): float -log2 probabilities
+    // with +1 smoothing, instead of integer Huffman lengths. The parse
+    // converges faster and chooses better matches; integer lengths are only
+    // used for the final emission.
+    const entropyTables = (lf, df) => {
+      let totL = 0, totD = 0;
+      for (let i = 0; i < 288; i++) totL += lf[i] + 1;
+      for (let i = 0; i < 30; i++) totD += df[i] + 1;
+      const litCost = new Float64Array(288);
+      for (let i = 0; i < 288; i++) litCost[i] = -Math.log2((lf[i] + 1) / totL);
+      const lenCost = new Float64Array(259);
+      for (let k = 3; k <= 258; k++) {
+        const [c, extra] = LEN_CODE[k];
+        lenCost[k] = -Math.log2((lf[257 + c] + 1) / totL) + extra;
+      }
+      const distCost = new Float64Array(30);
+      for (let c = 0; c < 30; c++) distCost[c] = -Math.log2((df[c] + 1) / totD);
+      return { litCost, lenCost, distCost };
+    };
+    let { litCost, lenCost, distCost } = entropyTables(litFreq, distFreq);
     let syms = null;
+    let prevSyms = null;
     for (let it = 0; it < iterations; it++) {
-      const lenCost = lenCostTable(litLenCost.subarray(257, 286));
-      syms = optimalParse(data, s, e, longest, dist, closeLen, closeDist, litLenCost, lenCost, distLenCost);
+      syms = optimalParse(data, s, e, segLen, segDist, litCost, lenCost, distCost);
+      if (prevSyms !== null && prevSyms.length === syms.length) {
+        let same = true;
+        for (let q = 0; q < syms.length; q++) {
+          const a = prevSyms[q], b = syms[q];
+          if (typeof a !== typeof b) { same = false; break; }
+          if (typeof a === 'number') { if (a !== b) { same = false; break; } }
+          else if (a.len !== b.len || a.dist !== b.dist) { same = false; break; }
+        }
+        if (same) break;
+      }
+      prevSyms = syms;
       ({ litFreq, distFreq } = symbolFreqs(syms));
-      litLenCost = buildLengths(smoothed(litFreq), 15);
-      distLenCost = buildLengths(smoothed(distFreq), 15);
+      ({ litCost, lenCost, distCost } = entropyTables(litFreq, distFreq));
     }
+    ({ litFreq, distFreq } = symbolFreqs(syms));
     const litLen = buildLengths(litFreq, 15);
     let distLen = buildLengths(distFreq, 15);
     if (distFreq.every((f) => f === 0)) { distLen = new Uint8Array(30); distLen[0] = 1; distLen[1] = 1; }
-    // Choose dynamic vs fixed vs stored by estimated size.
-    const dynBits = estimateBits(syms, litLen, distLen) + 3 + 5 + 5 + 4 + 19 * 3 + 200; // header + CL overhead estimate
-    const fixBits = estimateBits(syms, FIXED_LIT_LEN, FIXED_DIST_LEN) + 3;
+    // Block splitting (zopfli-style, table-only): greedily split the
+    // symbol sequence where separate Huffman tables pay off, measuring each
+    // candidate with the exact emit cost. Up to 4 splits per block.
+    const emitTrial = (fn) => {
+      const mark = { n: bw.out.length, buf: bw.bitbuf, cnt: bw.bitcnt };
+      fn();
+      const res = {
+        bytes: Uint8Array.from(bw.out.slice(mark.n)),
+        bitbuf: bw.bitbuf, bitcnt: bw.bitcnt,
+        bits: (bw.out.length - mark.n) * 8 + bw.bitcnt - mark.cnt,
+      };
+      bw.out.length = mark.n; bw.bitbuf = mark.buf; bw.bitcnt = mark.cnt;
+      return res;
+    };
+    const rangeLengths = (a, b) => {
+      const { litFreq: lf, distFreq: df } = symbolFreqsRange(syms, a, b);
+      const ll = buildLengths(lf, 15);
+      let dl = buildLengths(df, 15);
+      if (df.every((f) => f === 0)) { dl = new Uint8Array(30); dl[0] = 1; dl[1] = 1; }
+      return { ll, dl };
+    };
+    const measureRange = (a, b, fin) => {
+      const { ll, dl } = rangeLengths(a, b);
+      const dyn = emitTrial(() => emitBlock(bw, syms.slice(a, b), fin, ll, dl));
+      const fix = emitTrial(() => emitFixedBlock(bw, syms.slice(a, b), fin));
+      return Math.min(dyn.bits, fix.bits);
+    };
+    const emitRange = (a, b, fin) => {
+      const { ll, dl } = rangeLengths(a, b);
+      const dyn = emitTrial(() => emitBlock(bw, syms.slice(a, b), fin, ll, dl));
+      const fix = emitTrial(() => emitFixedBlock(bw, syms.slice(a, b), fin));
+      const win = fix.bits <= dyn.bits ? fix : dyn;
+      bw.out.push(...win.bytes);
+      bw.bitbuf = win.bitbuf; bw.bitcnt = win.bitcnt;
+      return win.bits;
+    };
     const storedBytes = (e - s) + 5 * Math.ceil((e - s) / 65535) + 1;
-    if (storedBytes * 8 <= Math.min(dynBits, fixBits)) {
+    if (storedBytes * 8 + 8 <= measureRange(0, syms.length, isFinal)) {
       emitStoredBlock(bw, data, s, e, isFinal);
-    } else if (fixBits <= dynBits) {
-      emitFixedBlock(bw, syms, isFinal);
     } else {
-      emitBlock(bw, syms, isFinal, litLen, distLen);
+      const ranges = [[0, syms.length]];
+      for (let sp = 0; sp < 4; sp++) {
+        let best = null;
+        for (let r = 0; r < ranges.length; r++) {
+          const [a, b] = ranges[r];
+          if (b - a < 200) continue;
+          const mid = (a + b) >> 1;
+          const saving = measureRange(a, b, false) - measureRange(a, mid, false) - measureRange(mid, b, false);
+          if (saving > 0 && (best === null || saving > best.saving)) best = { r, mid, saving };
+        }
+        if (!best) break;
+        const [a, b] = ranges[best.r];
+        ranges.splice(best.r, 1, [a, best.mid], [best.mid, b]);
+      }
+      for (let r = 0; r < ranges.length; r++) {
+        const [a, b] = ranges[r];
+        emitRange(a, b, isFinal && r === ranges.length - 1);
+      }
     }
     s = e;
   }
@@ -882,140 +1100,52 @@ function smoothed(freq) {
   return out;
 }
 
-// ---------- filter DP: re-choose each row's filter under a fixed-Huffman cost model ----------
-// v1's 'brute' picks each row's filter by zlib level-4 size of that row alone:
-// short-sighted, because a filter that looks slightly worse for this row can
-// set up much longer matches in the rows after it. This pass re-chooses every
-// row's filter to minimise an estimate of the row's true DEFLATE bit cost:
-// literals priced by the fixed Huffman lengths, matches priced by length code
-// + extra bits + 5-bit fixed distance code + distance extra bits, with matches
-// found against the already-chosen prefix (single-entry 3-byte hash table,
-// most recent position) and inside the candidate row itself. The prefix is the
-// stream the real deflate will see, so the cost model tracks the actual
-// objective. One deterministic sweep, bounded by the input size: no clock, no
-// randomness.
-function dpMatchCost(len, dist) {
-  const [lc, le] = LEN_CODE[len];
-  const [dc, de] = DIST_CODE[dist];
-  return FIXED_LIT_LEN[257 + lc] + le + 5 + de;
-}
-// Estimated bit cost of one filtered row, given the chosen prefix stream.
-// head: Int32Array(32768) hash -> most recent stream offset in pref (or -1).
-// rowPos/rowMark: stamp-indexed table of the most recent offset of each
-// 3-byte hash inside this row; mark identifies this evaluation.
-function estimateRowCost(row, pref, prefLen, head, rowPos, rowMark, mark) {
-  const n = row.length;
-  let bits = 0;
-  let p = 0;
-  while (p < n) {
-    let bestLen = 0, bestDist = 0;
-    if (p + 3 <= n) {
-      const h = ((row[p] << 10) ^ (row[p + 1] << 5) ^ row[p + 2]) & 32767;
-      // within-row candidate: most recent earlier offset with this hash
-      if (rowMark[h] === mark) {
-        const q = rowPos[h];
-        const dist = p - q;
-        const maxLen = Math.min(258, n - p);
-        let len = 0;
-        while (len < maxLen && row[p + len] === row[p + len - dist]) len++;
-        if (len >= 3) { bestLen = len; bestDist = dist; }
-      }
-      // prefix candidate: most recent stream offset with this hash
-      const r = head[h];
-      if (r >= 0) {
-        const dist = prefLen + 1 + p - r;
-        if (dist <= 32768) {
-          const maxLen = Math.min(258, n - p, prefLen - r);
-          let len = 0;
-          while (len < maxLen && pref[r + len] === row[p + len]) len++;
-          if (len >= 3 && (len > bestLen || (len === bestLen && dist < bestDist))) { bestLen = len; bestDist = dist; }
-        }
-      }
-    }
-    if (bestLen >= 3) {
-      bits += dpMatchCost(bestLen, bestDist);
-      if (p + 3 <= n) {
-        const h = ((row[p] << 10) ^ (row[p + 1] << 5) ^ row[p + 2]) & 32767;
-        rowPos[h] = p; rowMark[h] = mark;
-      }
-      p += bestLen;
-    } else {
-      bits += FIXED_LIT_LEN[row[p]];
-      if (p + 3 <= n) {
-        const h = ((row[p] << 10) ^ (row[p + 1] << 5) ^ row[p + 2]) & 32767;
-        rowPos[h] = p; rowMark[h] = mark;
-      }
-      p++;
-    }
-  }
-  return bits;
-}
-// Re-select every row's filter for one form's samples. Returns the DP stream:
-// one filter byte + filtered bytes per row, in row order.
-function reselectFilters(samples, width, height, bpp) {
-  const stride = width * bpp, rowLen = stride + 1;
-  const out = new Uint8Array(height * rowLen);
-  const head = new Int32Array(32768).fill(-1);
-  const rowPos = new Int32Array(32768);
-  const rowMark = new Uint32Array(32768);
-  const trial = Array.from({ length: 5 }, () => new Uint8Array(stride));
-  const seen = new Uint32Array(65536);
-  let stamp = 0, mark = 0, prefLen = 0;
-  for (let y = 0; y < height; y++) {
-    const cur = samples.subarray(y * stride, (y + 1) * stride);
-    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
-    let bestT = 0, bestCost = Infinity;
-    for (let t = 0; t < 5; t++) {
-      filterTrial(t, cur, prev, bpp, trial[t], seen, ++stamp);
-      const c = FIXED_LIT_LEN[t] + estimateRowCost(trial[t], out, prefLen, head, rowPos, rowMark, ++mark);
-      if (c < bestCost) { bestCost = c; bestT = t; }
-    }
-    const at = y * rowLen;
-    out[at] = bestT;
-    out.set(trial[bestT], at + 1);
-    // insert every stream offset of this row into the prefix hash table
-    for (let i = at; i < at + rowLen - 2; i++) {
-      const h = ((out[i] << 10) ^ (out[i + 1] << 5) ^ out[i + 2]) & 32767;
-      head[h] = i;
-    }
-    prefLen = at + rowLen;
-  }
-  return out;
-}
-
 // ---------- main ----------
 const SCREEN = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
 const FINAL = { level: 9, memLevel: 9 };
 
 for (const id of readdirSync(I).sort()) {
   const { width, height, rgba } = decodePng(new Uint8Array(readFileSync(join(I, id, 'image.png'))));
-  // Screen every form x filter choice at zlib level 6.
+  // Screen every form x filter choice at zlib level 6. The brute-force
+  // filter choice costs ~5 deflateSync per row, so it is computed only for
+  // the winning form (on the practice set it wins only there: 2 of 8
+  // instances, both on the winning form, never by flipping the form rank).
   let best = null; // {form, choice, data, bytes}
   for (const form of formsOf(rgba)) {
     const chunks = chunkBytes(form);
-    const cands = filterCandidates(form.samples, width, height, form.bpp, true);
+    const cands = filterCandidates(form.samples, width, height, form.bpp, false);
     for (const { choice, data } of cands) {
       const z = deflateSync(data, SCREEN);
       const bytes = z.length + chunks;
       if (best === null || bytes < best.bytes) best = { form, choice, data, bytes };
     }
   }
-  // Filter DP: re-choose every row's filter under the fixed-Huffman cost
-  // model; keep whichever stream (screen winner or DP) zlib level 9 writes
-  // smaller, then re-compress that winner.
-  const dpData = reselectFilters(best.form.samples, width, height, best.form.bpp);
-  const zDp = deflateSync(dpData, { ...FINAL, strategy: constants.Z_DEFAULT_STRATEGY }).length;
-  const zBest = deflateSync(best.data, { ...FINAL, strategy: constants.Z_DEFAULT_STRATEGY }).length;
-  if (zDp < zBest) best = { ...best, data: dpData, bytes: zDp + chunkBytes(best.form) };
-  // Re-compress the winner: zlib level 9 (both strategies) and the bounded
-  // optimal-parse deflate; keep the smallest stream overall.
+  {
+    const chunks = chunkBytes(best.form);
+    const { choice, data } = bruteCandidate(best.form.samples, width, height, best.form.bpp);
+    const z = deflateSync(data, SCREEN);
+    const bytes = z.length + chunks;
+    if (bytes < best.bytes) best = { form: best.form, choice, data, bytes };
+  }
+  // Re-compress the winner: zlib level 9 (both strategies) and the sublen
+  // optimal-parse deflate (entropy cost model, lazy greedy, block splitting);
+  // keep the smallest stream overall. Deflate strength adapts to the stream
+  // size so the whole set stays inside the 60 s wall: small streams get a
+  // longer chain and more iterations, large ones a shorter chain.
+  const n = best.data.length;
+  // Small streams (flat/grey, ~0.9 MB filtered) repay a long chain: the
+  // 3rd iteration buys only ~50-140 bytes, so 2 iterations suffice. Large
+  // streams (rich/alpha, ~2.8-3.7 MB) repay iterations more than chain.
+  const dopts = n < 1200000
+    ? { blockSize: 262144, chainLimit: 1024, iterations: 2 }
+    : { blockSize: 262144, chainLimit: 256, goodLen: 128, iterations: 3 };
   let bestZ = null, bestTotal = Infinity;
-  for (const strategy of [constants.Z_DEFAULT_STRATEGY, constants.Z_FILTERED]) {
-    const z = deflateSync(best.data, { ...FINAL, strategy });
+  {
+    const z = deflateSync(best.data, { ...FINAL, strategy: constants.Z_DEFAULT_STRATEGY });
     const total = z.length + chunkBytes(best.form);
     if (total < bestTotal) { bestTotal = total; bestZ = z; }
   }
-  const mine = deflateZlib(best.data, { blockSize: 262144, chainLimit: 128, iterations: 2, goodLen: 128 });
+  const mine = deflateZlib(best.data, dopts);
   if (mine.length + chunkBytes(best.form) < bestTotal) { bestTotal = mine.length + chunkBytes(best.form); bestZ = mine; }
   const chunks = [['IHDR', ihdrOf(width, height, best.form.colourType)]];
   if (best.form.plte !== null) chunks.push(['PLTE', best.form.plte]);
